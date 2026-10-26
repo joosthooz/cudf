@@ -6,6 +6,7 @@
 #include "groupby/common/utils.hpp"
 #include "groupby/sort/functors.hpp"
 #include "groupby/sort/group_reductions.hpp"
+#include "utilities/sorted_fastpath.hpp"
 
 #include <cudf/aggregation.hpp>
 #include <cudf/aggregation/host_udf.hpp>
@@ -144,6 +145,14 @@ template <>
 void aggregate_result_functor::operator()<aggregation::SUM>(aggregation const& agg)
 {
   if (cache.has_result(values, agg)) return;
+
+  if (cudf::detail::sorted_fastpath_enabled(cudf::detail::sorted_fastpath::GB_OFFSET_REDUCTIONS)) {
+    if (auto result = detail::group_sum_by_offsets(
+          get_unordered_grouped_values(), helper.group_offsets(stream), stream, mr.get_output_mr())) {
+      cache.add_result(values, agg, std::move(result));
+      return;
+    }
+  }
 
   cache.add_result(values,
                    agg,
@@ -941,9 +950,14 @@ std::pair<std::unique_ptr<table>, std::vector<aggregation_result>> groupby::sort
   // sum and count. std depends on mean and count
   cudf::detail::result_cache cache(requests.size());
 
+  auto const values_presorted =
+    cudf::detail::sorted_fastpath_enabled(cudf::detail::sorted_fastpath::GB_PRESORTED_VALUES) &&
+        helper().is_presorted()
+      ? sorted::YES
+      : sorted::NO;
   for (auto const& request : requests) {
-    auto store_functor =
-      detail::aggregate_result_functor(request.values, helper(), cache, stream, mr);
+    auto store_functor = detail::aggregate_result_functor(
+      request.values, helper(), cache, stream, mr, values_presorted);
     for (auto const& agg : request.aggregations) {
       // TODO (dm): single pass compute all supported reductions
       cudf::detail::aggregation_dispatcher(agg->kind, store_functor, *agg);

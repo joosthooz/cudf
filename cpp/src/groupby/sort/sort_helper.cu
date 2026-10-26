@@ -4,6 +4,7 @@
  */
 
 #include "sort_helper_group_offsets.cuh"
+#include "utilities/sorted_fastpath.hpp"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
@@ -38,6 +39,57 @@ namespace cudf {
 namespace groupby {
 namespace detail {
 namespace sort {
+
+namespace {
+
+/// Whether the presorted keys can be split into groups with direct typed comparisons.
+bool supports_typed_group_offsets(table_view const& keys)
+{
+  return std::all_of(keys.begin(), keys.end(), [](column_view const& col) {
+    return !col.has_nulls() && cudf::is_fixed_width(col.type()) &&
+           !cudf::is_floating_point(col.type());
+  });
+}
+
+struct mark_group_starts_fn {
+  template <typename T>
+  void operator()(column_view const& col, bool* flags, bool first, cuda::stream_ref stream) const
+    requires(cudf::is_fixed_width<T>())
+  {
+    using Storage   = cudf::device_storage_type_t<T>;
+    auto const data = col.data<Storage>();
+    thrust::transform(rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
+                      cuda::counting_iterator<size_type>{0},
+                      cuda::counting_iterator<size_type>{col.size()},
+                      flags,
+                      [data, flags, first] __device__(size_type row) -> bool {
+                        auto const differs = row == 0 || data[row] != data[row - 1];
+                        return first ? differs : (flags[row] || differs);
+                      });
+  }
+
+  template <typename T, typename... Args>
+  void operator()(Args&&...) const
+    requires(!cudf::is_fixed_width<T>())
+  {
+    CUDF_FAIL("Typed group offsets require fixed-width keys");
+  }
+};
+
+size_type compute_typed_group_offsets(table_view const& keys,
+                                      size_type* offsets,
+                                      cuda::stream_ref stream)
+{
+  auto const temp_mr = cudf::get_current_device_resource_ref();
+  auto flags = cuda::device_buffer<bool>(stream, temp_mr, keys.num_rows(), cuda::no_init);
+  for (size_type i = 0; i < keys.num_columns(); ++i) {
+    type_dispatcher<dispatch_storage_type>(
+      keys.column(i).type(), mark_group_starts_fn{}, keys.column(i), flags.data(), i == 0, stream);
+  }
+  return compact_group_offsets(flags.data(), keys.num_rows(), offsets, stream, temp_mr);
+}
+
+}  // namespace
 
 size_type compact_group_offsets(bool* flags,
                                 size_type size,
@@ -142,8 +194,18 @@ sort_groupby_helper::index_vector const& sort_groupby_helper::group_offsets(cuda
   // This way, a 2nd (parallel) call to this will not be given a partially created object.
   auto group_offsets = std::make_unique<index_vector>(size + 1, stream);
 
-  auto const sorted_order = key_sort_order(stream).data<size_type>();
   size_type num_groups;
+  if (cudf::detail::sorted_fastpath_enabled(cudf::detail::sorted_fastpath::GB_TYPED_OFFSETS) &&
+      is_presorted() && size == _keys.num_rows() && supports_typed_group_offsets(_keys)) {
+    num_groups = compute_typed_group_offsets(_keys, group_offsets->data(), stream);
+    group_offsets->set_element_async(num_groups, size, stream);
+    group_offsets->resize(num_groups + 1, stream);
+    stream.sync();
+    _group_offsets = std::move(group_offsets);
+    return *_group_offsets;
+  }
+
+  auto const sorted_order = key_sort_order(stream).data<size_type>();
   if (cudf::detail::has_nested_columns(_keys)) {
     num_groups = compute_nested_group_offsets(_keys, sorted_order, size, *group_offsets, stream);
   } else {
@@ -268,7 +330,18 @@ std::unique_ptr<table> sort_groupby_helper::unique_keys(cuda::stream_ref stream,
                                                         rmm::device_async_resource_ref mr)
 {
   auto const num_unique_keys = num_groups(stream);
-  auto gather_map            = cuda::device_buffer<size_type>(
+  if (cudf::detail::sorted_fastpath_enabled(cudf::detail::sorted_fastpath::GB_PRESORTED_VALUES) &&
+      is_presorted()) {
+    return cudf::detail::gather(
+      _keys,
+      device_span<size_type const>{group_offsets(stream).data(),
+                                   static_cast<std::size_t>(num_unique_keys)},
+      out_of_bounds_policy::DONT_CHECK,
+      negative_index_policy::NOT_ALLOWED,
+      stream,
+      mr);
+  }
+  auto gather_map = cuda::device_buffer<size_type>(
     stream, cudf::get_current_device_resource_ref(), num_unique_keys, cuda::no_init);
   auto const idx_data = key_sort_order(stream).data<size_type>();
   thrust::transform(rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
