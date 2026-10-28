@@ -145,6 +145,12 @@ void aggregate_result_functor::operator()<aggregation::SUM>(aggregation const& a
 {
   if (cache.has_result(values, agg)) return;
 
+  if (auto result = detail::group_sum_by_offsets(
+        get_unordered_grouped_values(), helper.group_offsets(stream), stream, mr.get_output_mr())) {
+    cache.add_result(values, agg, std::move(result));
+    return;
+  }
+
   cache.add_result(values,
                    agg,
                    detail::group_sum(get_unordered_grouped_values(),

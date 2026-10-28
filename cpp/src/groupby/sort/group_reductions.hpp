@@ -45,6 +45,20 @@ std::unique_ptr<column> group_sum(column_view const& values,
                                   rmm::device_async_resource_ref mr);
 
 /**
+ * @brief Internal API to calculate groupwise sum of non-null numeric values from group offsets.
+ *
+ * @param values Grouped values to sum
+ * @param group_offsets Offsets of group starts, followed by the number of grouped values
+ * @param stream CUDA stream used for device memory operations and kernel launches.
+ * @param mr Device memory resource used to allocate the returned column's device memory
+ * @return The sums, or nullptr when the values or group sizes are not supported
+ */
+std::unique_ptr<column> group_sum_by_offsets(column_view const& values,
+                                             cudf::device_span<size_type const> group_offsets,
+                                             cuda::stream_ref stream,
+                                             rmm::device_async_resource_ref mr);
+
+/**
  * @brief Internal API to calculate groupwise sum with overflow detection.
  *
  * Returns a STRUCT column with two children: the (wrapping) sum and a BOOL8 overflow flag that is
